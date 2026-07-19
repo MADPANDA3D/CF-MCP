@@ -32,6 +32,21 @@ def _values(content: str) -> dict[str, str]:
     }
 
 
+def test_runtime_smoke_byok_probe_remains_callable_under_pinned_policy() -> None:
+    from cloudflare_mcp.coverage import find_operation
+
+    smoke_source = (Path(__file__).parents[1] / "scripts" / "runtime_smoke.py").read_text(
+        encoding="utf-8"
+    )
+    operation = find_operation("GET", "/zones")
+
+    assert 'PROVIDER_SMOKE_PATH = "/zones"' in smoke_source
+    assert operation is not None
+    assert operation["coverage_status"] == "callable"
+    assert operation["classification"] == "read"
+    assert operation["high_risk"] is False
+
+
 def test_initializer_generates_mode_specific_service_and_separate_approval_secrets(
     tmp_path: Path,
 ) -> None:

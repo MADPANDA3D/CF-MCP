@@ -16,6 +16,7 @@ EXPECTED_TOOL_COUNT = int(os.getenv("MCP_EXPECTED_TOOL_COUNT", "6"))
 EXPECTED_BUILD_SHA = os.environ["MCP_BUILD_SHA"]
 EXPECTED_SOURCE_FINGERPRINT = os.environ["MCP_SOURCE_FINGERPRINT"]
 EXPECTED_IMAGE_REFERENCE = os.environ["MCP_IMAGE_REFERENCE"]
+PROVIDER_SMOKE_PATH = "/zones"
 ACCESS_TOKEN = os.getenv("MCP_ACCESS_TOKEN", "")
 PORTAL_GRANT = os.getenv("MCP_PORTAL_GRANT_TOKEN", "")
 TENANT_ID_HEADER = os.getenv("MCP_TENANT_ID_HEADER", "x-madpanda-user-id")
@@ -168,7 +169,10 @@ def main() -> None:
         payload=rpc(
             "tools/call",
             6,
-            {"name": "cloudflare_api_request", "arguments": {"method": "GET", "path": "/accounts"}},
+            {
+                "name": "cloudflare_api_request",
+                "arguments": {"method": "GET", "path": PROVIDER_SMOKE_PATH},
+            },
         ),
         headers=discovery_headers,
     )
