@@ -450,10 +450,12 @@ jobs:
           SDIST_SHA256=$(sha256sum "dist/$SDIST" | awk '{print $1}')
           [[ "$WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
-          echo "wheel_name=$WHEEL" >> "$GITHUB_OUTPUT"
-          echo "wheel_sha256=$WHEEL_SHA256" >> "$GITHUB_OUTPUT"
-          echo "sdist_name=$SDIST" >> "$GITHUB_OUTPUT"
-          echo "sdist_sha256=$SDIST_SHA256" >> "$GITHUB_OUTPUT"
+          {
+            echo "wheel_name=$WHEEL"
+            echo "wheel_sha256=$WHEEL_SHA256"
+            echo "sdist_name=$SDIST"
+            echo "sdist_sha256=$SDIST_SHA256"
+          } >> "$GITHUB_OUTPUT"
 
   image:
     name: Publish and verify a run-scoped image candidate
@@ -744,7 +746,8 @@ jobs:
           EXPECTED_SDIST_NAME: ${{ needs.package.outputs.sdist_name }}
           EXPECTED_SDIST_SHA256: ${{ needs.package.outputs.sdist_sha256 }}
         run: |
-          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          export SOURCE_DATE_EPOCH
           [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
           [[ "$EXPECTED_WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
@@ -897,7 +900,8 @@ jobs:
           EXPECTED_SDIST_NAME: ${{ needs.package.outputs.sdist_name }}
           EXPECTED_SDIST_SHA256: ${{ needs.package.outputs.sdist_sha256 }}
         run: |
-          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          export SOURCE_DATE_EPOCH
           [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
           [[ "$EXPECTED_WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
