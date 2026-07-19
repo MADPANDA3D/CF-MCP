@@ -161,18 +161,18 @@ jobs:
       actions: read
       contents: read
     steps:
-      - name: Require the public canonical repository and protected main
+      - name: Check out exact release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Require exact public refs and the publicly visible ruleset contract
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          test "$GITHUB_REPOSITORY" = MADPANDA3D/CF-MCP
-          VISIBILITY=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)
-          DEFAULT_BRANCH=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
-          PROTECTED=$(gh api "repos/$GITHUB_REPOSITORY/branches/$DEFAULT_BRANCH" --jq .protected)
-          if [[ "$VISIBILITY" != public || "$DEFAULT_BRANCH" != main || "$PROTECTED" != true ]]; then
-            echo "::error::Release requires public MADPANDA3D/CF-MCP with protected default branch main."
-            exit 1
-          fi
+          bash .github/scripts/require-release-refs.sh
+          bash .github/scripts/verify-live-ruleset.sh \
+            --allow-hidden-bypass-actors
       - name: Require successful exact-SHA Verify workflow
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -288,6 +288,10 @@ jobs:
 
           echo "::error::No successful public CodeQL analysis exists for exact main SHA $GITHUB_SHA."
           exit 1
+      - name: Revalidate release refs after every public quality gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/require-release-refs.sh
 
   compose:
     name: Validate every Compose deployment variant
@@ -374,8 +378,10 @@ jobs:
     outputs:
       wheel_name: ${{ steps.artifacts.outputs.wheel_name }}
       wheel_sha256: ${{ steps.artifacts.outputs.wheel_sha256 }}
+      wheel_size: ${{ steps.artifacts.outputs.wheel_size }}
       sdist_name: ${{ steps.artifacts.outputs.sdist_name }}
       sdist_sha256: ${{ steps.artifacts.outputs.sdist_sha256 }}
+      sdist_size: ${{ steps.artifacts.outputs.sdist_size }}
     steps:
       - name: Check out exact tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -448,13 +454,19 @@ jobs:
           test -n "$SDIST"
           WHEEL_SHA256=$(sha256sum "dist/$WHEEL" | awk '{print $1}')
           SDIST_SHA256=$(sha256sum "dist/$SDIST" | awk '{print $1}')
+          WHEEL_SIZE=$(wc -c < "dist/$WHEEL")
+          SDIST_SIZE=$(wc -c < "dist/$SDIST")
           [[ "$WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$WHEEL_SIZE" =~ ^[0-9]+$ ]]
+          [[ "$SDIST_SIZE" =~ ^[0-9]+$ ]]
           {
             echo "wheel_name=$WHEEL"
             echo "wheel_sha256=$WHEEL_SHA256"
+            echo "wheel_size=$WHEEL_SIZE"
             echo "sdist_name=$SDIST"
             echo "sdist_sha256=$SDIST_SHA256"
+            echo "sdist_size=$SDIST_SIZE"
           } >> "$GITHUB_OUTPUT"
 
   image:
@@ -781,12 +793,18 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [package, image, public-quality-gates, attest-release-subjects]
     permissions:
-      contents: read
+      # Push access is required to see draft releases during the read-only preflight.
+      contents: write
       packages: write
     env:
       CANDIDATE_REF: ${{ needs.image.outputs.candidate_ref }}
       IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
     steps:
+      - name: Check out exact release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Log in to GHCR
@@ -850,6 +868,72 @@ jobs:
                 ;;
             esac
           done
+      - name: Require a safe GitHub Release state and exact refs before promotion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_WHEEL_NAME: ${{ needs.package.outputs.wheel_name }}
+          EXPECTED_WHEEL_SHA256: ${{ needs.package.outputs.wheel_sha256 }}
+          EXPECTED_WHEEL_SIZE: ${{ needs.package.outputs.wheel_size }}
+          EXPECTED_SDIST_NAME: ${{ needs.package.outputs.sdist_name }}
+          EXPECTED_SDIST_SHA256: ${{ needs.package.outputs.sdist_sha256 }}
+          EXPECTED_SDIST_SIZE: ${{ needs.package.outputs.sdist_size }}
+        run: |
+          [[ "$EXPECTED_WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_WHEEL_SIZE" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SDIST_SIZE" =~ ^[0-9]+$ ]]
+          mkdir -p release
+          printf '%s  %s\n%s  %s\n' \
+            "$EXPECTED_WHEEL_SHA256" "$EXPECTED_WHEEL_NAME" \
+            "$EXPECTED_SDIST_SHA256" "$EXPECTED_SDIST_NAME" \
+            > release/SHA256SUMS
+          bash .github/scripts/write-release-notes.sh \
+            /tmp/cloudflare-mcp-release-notes.md
+
+          RELEASE_TITLE='MADPANDA3D Cloudflare MCP v1.0.0'
+          RELEASE_JSON=/tmp/cloudflare-mcp-release.json
+          RELEASE_STATE=$(bash .github/scripts/read-github-release.sh \
+            "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" \
+            "$RELEASE_JSON")
+          if [[ "$RELEASE_STATE" == present ]]; then
+            python scripts/check_github_release.py \
+              --release-json "$RELEASE_JSON" \
+              --tag "$GITHUB_REF_NAME" \
+              --title "$RELEASE_TITLE" \
+              --body-file /tmp/cloudflare-mcp-release-notes.md \
+              --draft any \
+              --prerelease any \
+              --asset-metadata \
+                "$EXPECTED_WHEEL_NAME=$EXPECTED_WHEEL_SIZE=sha256:$EXPECTED_WHEEL_SHA256" \
+              --asset-metadata \
+                "$EXPECTED_SDIST_NAME=$EXPECTED_SDIST_SIZE=sha256:$EXPECTED_SDIST_SHA256" \
+              --asset 'SHA256SUMS=release/SHA256SUMS' || {
+                echo "::error::Existing release is partial or differs from verified bytes. Stable image tags remain untouched; owner cleanup is required."
+                exit 1
+              }
+            IMMUTABLE=$(jq -r '.immutable // false' "$RELEASE_JSON")
+            if [[ "$IMMUTABLE" == true ]]; then
+              python scripts/check_github_release.py \
+                --release-json "$RELEASE_JSON" \
+                --tag "$GITHUB_REF_NAME" \
+                --title "$RELEASE_TITLE" \
+                --body-file /tmp/cloudflare-mcp-release-notes.md \
+                --draft false \
+                --prerelease false \
+                --asset-metadata \
+                  "$EXPECTED_WHEEL_NAME=$EXPECTED_WHEEL_SIZE=sha256:$EXPECTED_WHEEL_SHA256" \
+                --asset-metadata \
+                  "$EXPECTED_SDIST_NAME=$EXPECTED_SDIST_SIZE=sha256:$EXPECTED_SDIST_SHA256" \
+                --asset 'SHA256SUMS=release/SHA256SUMS'
+              test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" \
+                = "$GITHUB_REF_NAME"
+            fi
+          elif [[ "$RELEASE_STATE" != absent ]]; then
+            echo "::error::Unexpected GitHub Release classification: $RELEASE_STATE"
+            exit 1
+          fi
+          bash .github/scripts/require-release-refs.sh
       - name: Attach missing release tags to the exact candidate digest
         run: |
           while IFS= read -r tag; do
@@ -871,6 +955,10 @@ jobs:
               exit 1
             fi
           done
+      - name: Revalidate release refs after stable-tag promotion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/require-release-refs.sh
 
   github-release:
     name: Create GitHub Release last
@@ -919,36 +1007,96 @@ jobs:
             "$EXPECTED_SDIST_SHA256" "$EXPECTED_SDIST_NAME" \
             > release/SHA256SUMS
           (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
-      - name: Create or repair the final GitHub Release
+      - name: Create or verify the exact GitHub Release last
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+          EXPECTED_WHEEL_NAME: ${{ needs.package.outputs.wheel_name }}
+          EXPECTED_SDIST_NAME: ${{ needs.package.outputs.sdist_name }}
         run: |
-          cat > /tmp/cloudflare-mcp-release-notes.md <<EOF
-          Cloudflare MCP v1.0.0 clean public release.
+          bash .github/scripts/require-release-refs.sh
+          bash .github/scripts/write-release-notes.sh \
+            /tmp/cloudflare-mcp-release-notes.md
 
-          Python wheel and source archive are attached to this GitHub Release.
-          This project intentionally does not publish to PyPI.
+          RELEASE_TITLE='MADPANDA3D Cloudflare MCP v1.0.0'
+          RELEASE_JSON=/tmp/cloudflare-mcp-release.json
+          read_release() {
+            bash .github/scripts/read-github-release.sh \
+              "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" \
+              "$RELEASE_JSON"
+          }
+          validate_release() {
+            local expected_draft=$1
+            local expected_prerelease=$2
+            python scripts/check_github_release.py \
+              --release-json "$RELEASE_JSON" \
+              --tag "$GITHUB_REF_NAME" \
+              --title "$RELEASE_TITLE" \
+              --body-file /tmp/cloudflare-mcp-release-notes.md \
+              --draft "$expected_draft" \
+              --prerelease "$expected_prerelease" \
+              --asset "$EXPECTED_WHEEL_NAME=dist/$EXPECTED_WHEEL_NAME" \
+              --asset "$EXPECTED_SDIST_NAME=dist/$EXPECTED_SDIST_NAME" \
+              --asset 'SHA256SUMS=release/SHA256SUMS'
+          }
 
-          Container: \`${IMAGE_NAME}@${IMAGE_DIGEST}\`
+          RELEASE_STATE=$(read_release)
+          if [[ "$RELEASE_STATE" == present ]]; then
+            if ! validate_release any any; then
+              echo "::error::Existing $GITHUB_REF_NAME release metadata or assets differ from the verified release. No existing asset was changed; owner review is required."
+              exit 1
+            fi
+          elif [[ "$RELEASE_STATE" == absent ]]; then
+            bash .github/scripts/require-release-refs.sh
+            gh release create "$GITHUB_REF_NAME" \
+              "dist/$EXPECTED_WHEEL_NAME" \
+              "dist/$EXPECTED_SDIST_NAME" \
+              release/SHA256SUMS \
+              --repo "$GH_REPO" \
+              --verify-tag \
+              --draft \
+              --title "$RELEASE_TITLE" \
+              --notes-file /tmp/cloudflare-mcp-release-notes.md
+            test "$(read_release)" = present
+            validate_release true false
+          else
+            echo "::error::Unexpected GitHub Release classification: $RELEASE_STATE"
+            exit 1
+          fi
 
-          Verify package files with the attached SHA256SUMS and deploy the container by exact digest.
-          EOF
-          if gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" dist/* release/SHA256SUMS \
-              --repo "$GH_REPO" --clobber
+          IMMUTABLE=$(jq -r '.immutable // false' "$RELEASE_JSON")
+          if [[ "$IMMUTABLE" == true ]]; then
+            validate_release false false
+            test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$GITHUB_REF_NAME"
+          else
+            bash .github/scripts/require-release-refs.sh
             gh release edit "$GITHUB_REF_NAME" \
               --repo "$GH_REPO" \
               --verify-tag \
-              --title "MADPANDA3D Cloudflare MCP v1.0.0" \
+              --draft=false \
+              --prerelease=false \
+              --title "$RELEASE_TITLE" \
               --notes-file /tmp/cloudflare-mcp-release-notes.md \
               --latest
-          else
-            gh release create "$GITHUB_REF_NAME" dist/* release/SHA256SUMS \
-              --repo "$GH_REPO" \
-              --verify-tag \
-              --title "MADPANDA3D Cloudflare MCP v1.0.0" \
-              --notes-file /tmp/cloudflare-mcp-release-notes.md \
-              --latest
+            test "$(read_release)" = present
           fi
+
+          validate_release false false
+          test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$GITHUB_REF_NAME"
+          bash .github/scripts/require-release-refs.sh
+
+          READBACK_DIR=$(mktemp -d -p /tmp cloudflare-release-readback.XXXXXX)
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GH_REPO" \
+            --dir "$READBACK_DIR" \
+            --pattern "$EXPECTED_WHEEL_NAME" \
+            --pattern "$EXPECTED_SDIST_NAME" \
+            --pattern SHA256SUMS
+          test "$(find "$READBACK_DIR" -maxdepth 1 -type f | wc -l)" -eq 3
+          diff -u release/SHA256SUMS "$READBACK_DIR/SHA256SUMS"
+          (cd "$READBACK_DIR" && sha256sum --check --strict SHA256SUMS)
+          test "$(read_release)" = present
+          validate_release false false
+          test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$GITHUB_REF_NAME"
+          bash .github/scripts/require-release-refs.sh
