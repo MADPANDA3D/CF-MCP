@@ -12,7 +12,7 @@ license = "MIT"
 authors = [{ name = "MADPANDA3D" }]
 keywords = ["mcp", "fastmcp", "cloudflare", "byok", "ai-agents"]
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
