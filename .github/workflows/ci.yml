@@ -1,0 +1,329 @@
+name: Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks@sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb
+  UV_VERSION: 0.11.29
+
+jobs:
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out full publishable history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan source and history with Gitleaks
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/repo:ro" --workdir /repo \
+            "$GITLEAKS_IMAGE" git --redact --verbose --no-banner .
+      - name: Validate workflow syntax and semantics
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl --fail --location --silent --show-error \
+            --output /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint
+
+  source-scan:
+    name: Filesystem policy scan
+    runs-on: ubuntu-24.04
+    needs: secret-scan
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Scan source configuration and secrets with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          scan-type: fs
+          scan-ref: .
+          scanners: misconfig,secret
+          format: table
+          exit-code: 1
+          severity: HIGH,CRITICAL
+
+  test:
+    name: Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    needs: [secret-scan, source-scan]
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12.13', '3.13.11']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install exact locked environment
+        run: uv sync --frozen --group dev
+      - name: Require the exact setup interpreter
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          assert sys.version.split()[0] == os.environ['UV_PYTHON'], sys.version
+          PY
+          uv run python - <<'PY'
+          import os
+          import sys
+
+          assert sys.version.split()[0] == os.environ['UV_PYTHON'], sys.version
+          PY
+      - name: Verify exported runtime lock is current
+        if: matrix.python == '3.12.13'
+        run: |
+          uv export --frozen --no-dev --no-emit-project \
+            --format requirements-txt --output-file requirements.lock
+          git diff --exit-code -- requirements.lock
+      - name: Compile package sources
+        run: uv run python -m compileall -q src scripts
+      - name: Run offline conformance suite
+        run: uv run pytest -q -p no:cacheprovider
+      - name: Catch lint failures
+        run: uv run ruff check .
+      - name: Enforce deterministic Python formatting
+        run: uv run ruff format --check .
+      - name: Enforce deterministic import order
+        run: uv run isort --check-only src scripts tests
+      - name: Run static type analysis
+        run: uv run mypy --strict src tests
+      - name: Enforce public-source boundary
+        if: matrix.python == '3.12.13'
+        run: uv run python scripts/check_source_safety.py
+      - name: Reject high-severity source findings
+        if: matrix.python == '3.12.13'
+        run: uv run bandit -q -r src/cloudflare_mcp -lll
+      - name: Audit locked runtime dependencies
+        if: matrix.python == '3.12.13'
+        run: uv run pip-audit --requirement requirements.lock
+      - name: Rebuild the pinned Cloudflare endpoint inventory exactly
+        if: matrix.python == '3.12.13'
+        env:
+          CLOUDFLARE_SCHEMA_URL: https://raw.githubusercontent.com/cloudflare/api-schemas/aefa753f1190c85866f65dcc7f348e18c7a1ca4a/openapi.json
+          CLOUDFLARE_SCHEMA_SHA256: 6c141cf38b45a514fcba04d322d43916eaba179a4442c8d91afaf5e7a66c8f1f
+        run: |
+          curl --fail --location --silent --show-error \
+            --output /tmp/cloudflare-openapi.json \
+            "$CLOUDFLARE_SCHEMA_URL"
+          echo "$CLOUDFLARE_SCHEMA_SHA256  /tmp/cloudflare-openapi.json" \
+            | sha256sum --check --strict
+          uv run python scripts/build_endpoint_coverage.py /tmp/cloudflare-openapi.json
+          git diff --exit-code -- \
+            src/cloudflare_mcp/data/endpoint_coverage.json \
+            docs/endpoint-coverage.md
+
+  package:
+    name: Python package
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.12.13
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Fix the reproducible package epoch to the source commit
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
+      - name: Build twice and prove deterministic package artifacts
+        run: |
+          uv sync --frozen --group dev
+          mkdir -p /tmp/cloudflare-ci-package-rebuild
+          uv build --out-dir dist
+          uv build --out-dir /tmp/cloudflare-ci-package-rebuild
+          (cd dist && sha256sum -- *.whl *.tar.gz | sort) \
+            > /tmp/cloudflare-ci-package-first.sha256
+          (cd /tmp/cloudflare-ci-package-rebuild && sha256sum -- *.whl *.tar.gz | sort) \
+            > /tmp/cloudflare-ci-package-second.sha256
+          diff -u \
+            /tmp/cloudflare-ci-package-first.sha256 \
+            /tmp/cloudflare-ci-package-second.sha256
+          uv run twine check dist/*.whl dist/*.tar.gz
+          uv run python scripts/check_package_archives.py
+      - name: Verify package version and console entry point
+        run: |
+          PACKAGE_VERSION=$(python - <<'PY'
+          import tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              print(tomllib.load(handle)['project']['version'])
+          PY
+          )
+          test "$PACKAGE_VERSION" = "1.0.0"
+          uv run python - <<'PY'
+          from importlib.metadata import entry_points
+          matches = [item for item in entry_points(group='console_scripts') if item.name == 'cloudflare-mcp']
+          assert len(matches) == 1
+          assert matches[0].value == 'cloudflare_mcp.server:main'
+          PY
+      - name: Install and import the exact built wheel in a clean environment
+        run: |
+          python -m venv /tmp/cloudflare-wheel-venv
+          /tmp/cloudflare-wheel-venv/bin/python -m pip install \
+            --disable-pip-version-check --require-hashes \
+            --requirement requirements.lock
+          /tmp/cloudflare-wheel-venv/bin/python -m pip install \
+            --disable-pip-version-check --no-deps dist/*.whl
+          /tmp/cloudflare-wheel-venv/bin/python - <<'PY'
+          from importlib.metadata import entry_points, version
+          from cloudflare_mcp import __version__
+          from cloudflare_mcp.server import TOOL_NAMES
+          from cloudflare_mcp.tool_manifest import build_tool_manifest
+          assert version('madpanda-cloudflare-mcp') == '1.0.0'
+          assert __version__ == '1.0.0'
+          assert len(TOOL_NAMES) == 6
+          assert build_tool_manifest()['counts']['agentReady'] == 5
+          matches = [item for item in entry_points(group='console_scripts') if item.name == 'cloudflare-mcp']
+          assert len(matches) == 1
+          assert matches[0].value == 'cloudflare_mcp.server:main'
+          PY
+
+  image:
+    name: Hardened image
+    runs-on: ubuntu-24.04
+    needs: [test, package]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Validate every Compose deployment variant
+        env:
+          MCP_ACCESS_TOKEN: ci-standalone-token-000000000000000000000000000000000000000000
+          MCP_PORTAL_GRANT_TOKEN: ci-portal-grant-000000000000000000000000000000000000000000
+          MCP_BUILD_SHA: 0000000000000000000000000000000000000001
+          MCP_SOURCE_FINGERPRINT: 1111111111111111111111111111111111111111111111111111111111111111
+          MCP_RELEASE_DIGEST: 2222222222222222222222222222222222222222222222222222222222222222
+          MCP_TENANT_ID_HEADER: x-madpanda-user-id
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.portal.yml config --quiet
+          docker compose -f docker-compose.release.yml config --quiet
+          docker compose -f docker-compose.portal.release.yml config --quiet
+          for manifest in \
+            docker-compose.yml \
+            docker-compose.portal.yml \
+            docker-compose.release.yml \
+            docker-compose.portal.release.yml; do
+            docker compose -f "$manifest" config --format json \
+              > "/tmp/${manifest}.json"
+          done
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected_digest = '2' * 64
+          expected_image = (
+              'ghcr.io/madpanda3d/cloudflare-mcp-server@sha256:'
+              f'{expected_digest}'
+          )
+          variants = {
+              'docker-compose.yml': ('standalone', True),
+              'docker-compose.portal.yml': ('portal', True),
+              'docker-compose.release.yml': ('standalone', False),
+              'docker-compose.portal.release.yml': ('portal', False),
+          }
+          for manifest, (mode, source_build) in variants.items():
+              config = json.loads(Path(f'/tmp/{manifest}.json').read_text())
+              service = config['services']['cloudflare-mcp']
+              assert ('build' in service) is source_build, manifest
+              assert service['read_only'] is True, manifest
+              assert service['user'] == '10001:10001', manifest
+              assert service['cap_drop'] == ['ALL'], manifest
+              assert service['security_opt'] == ['no-new-privileges:true'], manifest
+              environment = service['environment']
+              assert environment['MCP_MODE'] == mode, manifest
+              assert 'MCP_BUILD_SHA' not in environment, manifest
+              assert 'MCP_SOURCE_FINGERPRINT' not in environment, manifest
+              assert 'MCP_APPROVAL_SIGNING_KEY' in environment, manifest
+              assert not environment['MCP_APPROVAL_SIGNING_KEY'], manifest
+              assert 'MCP_ALLOW_HIGH_RISK_OPERATIONS' not in environment, manifest
+              if mode == 'portal':
+                  assert environment['MCP_TENANT_ID_HEADER'] == 'x-madpanda-user-id', manifest
+              else:
+                  assert 'MCP_TENANT_ID_HEADER' not in environment, manifest
+              if source_build:
+                  assert service['image'] == 'cloudflare-mcp:local-source', manifest
+                  assert environment.get('MCP_IMAGE_REFERENCE') is None, manifest
+                  assert service['build']['args']['BUILD_SHA'] == os.environ['MCP_BUILD_SHA'], manifest
+                  assert service['build']['args']['SOURCE_FINGERPRINT'] == os.environ['MCP_SOURCE_FINGERPRINT'], manifest
+              else:
+                  assert service['image'] == expected_image, manifest
+                  assert service['pull_policy'] == 'always', manifest
+                  assert environment['MCP_IMAGE_REFERENCE'] == expected_image, manifest
+          PY
+      - name: Build exact source
+        id: source
+        run: |
+          SOURCE_FINGERPRINT=$(git archive --format=tar HEAD | sha256sum | awk '{print $1}')
+          echo "fingerprint=$SOURCE_FINGERPRINT" >> "$GITHUB_OUTPUT"
+          docker build \
+            --build-arg BUILD_SHA="$GITHUB_SHA" \
+            --build-arg SOURCE_FINGERPRINT="$SOURCE_FINGERPRINT" \
+            --build-arg IMAGE_VERSION=1.0.0 \
+            --tag cloudflare-mcp:ci \
+            .
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          image-ref: cloudflare-mcp:ci
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - name: Smoke Portal and standalone modes without provider calls
+        run: |
+          bash .github/scripts/smoke-image.sh \
+            cloudflare-mcp:ci \
+            "$GITHUB_SHA" \
+            "${{ steps.source.outputs.fingerprint }}" \
+            development

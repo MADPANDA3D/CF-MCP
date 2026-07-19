@@ -1,0 +1,98 @@
+[build-system]
+requires = ["hatchling==1.31.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "madpanda-cloudflare-mcp"
+version = "1.0.0"
+description = "Dual-mode, request-scoped BYOK MCP server for Cloudflare's REST API"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+authors = [{ name = "MADPANDA3D" }]
+keywords = ["mcp", "fastmcp", "cloudflare", "byok", "ai-agents"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+dependencies = [
+  "fastmcp>=3.4.0,<4",
+  "httpx>=0.28.1,<1",
+  "pydantic>=2.13.4,<3",
+  "starlette>=1.3.1,<2",
+  "uvicorn>=0.51.0,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/MADPANDA3D/CF-MCP"
+Documentation = "https://github.com/MADPANDA3D/CF-MCP#readme"
+Issues = "https://github.com/MADPANDA3D/CF-MCP/issues"
+Security = "https://github.com/MADPANDA3D/CF-MCP/security/policy"
+Source = "https://github.com/MADPANDA3D/CF-MCP"
+
+[dependency-groups]
+dev = [
+  "bandit[toml]>=1.9.2,<2",
+  "build>=1.3.0,<2",
+  "httpx2>=2.7.0,<3",
+  "isort>=8.0.1,<9",
+  "jsonschema>=4.26.0,<5",
+  "mypy>=2.3.0,<3",
+  "pip-audit>=2.9.0,<3",
+  "pytest>=9.1.1,<10",
+  "pytest-asyncio>=1.3.0,<2",
+  "ruff>=0.15.0,<1",
+  "twine>=6.2.0,<7",
+  "types-jsonschema>=4.26.0.20250516,<5",
+]
+
+[project.scripts]
+cloudflare-mcp = "cloudflare_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cloudflare_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/cloudflare_mcp/data/endpoint_coverage.json" = "cloudflare_mcp/data/endpoint_coverage.json"
+"src/cloudflare_mcp/py.typed" = "cloudflare_mcp/py.typed"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/cloudflare_mcp",
+  "/README.md",
+  "/LICENSE",
+  "/NOTICE",
+  "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["cloudflare_mcp"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B104"]
+
+[tool.uv]
+required-version = "==0.11.29"

@@ -1,0 +1,884 @@
+name: Release v1.0.0
+
+on:
+  push:
+    tags: ['v1.0.0']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/madpanda3d/cloudflare-mcp-server
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks@sha256:b109bc5f8f76a38196a3e413704fc5b9e3c32360bce4e4b603bd6f45b3721dbb
+  UV_VERSION: 0.11.29
+
+jobs:
+  verify-python:
+    name: Python ${{ matrix.python }} exact-tag verification
+    runs-on: ubuntu-24.04
+    env:
+      UV_PYTHON: ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.12.13', '3.13.11']
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Require the exact setup interpreter
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          assert sys.version.split()[0] == os.environ['UV_PYTHON'], sys.version
+          PY
+      - name: Verify annotated v1.0.0 tag at the exact main tip
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$GITHUB_REPOSITORY" = MADPANDA3D/CF-MCP
+          test "$DEFAULT_BRANCH" = main
+          test "$GITHUB_REF_NAME" = v1.0.0
+          test "$(git cat-file -t "refs/tags/$GITHUB_REF_NAME")" = tag
+          RELEASE_SHA=$(git rev-parse HEAD)
+          TAG_SHA=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{}")
+          test "$RELEASE_SHA" = "$TAG_SHA"
+          test "$RELEASE_SHA" = "$GITHUB_SHA"
+          git fetch --no-tags origin \
+            "+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"
+          DEFAULT_BRANCH_SHA=$(git rev-parse "refs/remotes/origin/$DEFAULT_BRANCH")
+          if [[ "$RELEASE_SHA" != "$DEFAULT_BRANCH_SHA" ]]; then
+            echo "::error::The release tag points to $RELEASE_SHA, but origin/$DEFAULT_BRANCH is $DEFAULT_BRANCH_SHA. Refusing to publish a stale or off-branch tag."
+            exit 1
+          fi
+          PACKAGE_VERSION=$(python - <<'PY'
+          import tomllib
+          with open('pyproject.toml', 'rb') as handle:
+              print(tomllib.load(handle)['project']['version'])
+          PY
+          )
+          test "$PACKAGE_VERSION" = 1.0.0
+          test "${GITHUB_REF_NAME#v}" = "$PACKAGE_VERSION"
+      - name: Test exact tag on Python ${{ matrix.python }}
+        run: |
+          uv sync --frozen --group dev
+          uv run python - <<'PY'
+          import os
+          import sys
+
+          assert sys.version.split()[0] == os.environ['UV_PYTHON'], sys.version
+          PY
+          uv run python -m compileall -q src scripts tests
+          uv run pytest -q -p no:cacheprovider
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run isort --check-only src scripts tests
+          uv run mypy --strict src tests
+      - name: Run single-version source and dependency gates
+        if: matrix.python == '3.12.13'
+        run: |
+          uv run python scripts/check_source_safety.py
+          uv export --frozen --no-dev --no-emit-project \
+            --format requirements-txt --output-file requirements.lock
+          git diff --exit-code -- requirements.lock
+          uv run bandit -q -r src/cloudflare_mcp -lll
+          uv run pip-audit --requirement requirements.lock
+      - name: Rebuild the pinned Cloudflare endpoint inventory exactly
+        if: matrix.python == '3.12.13'
+        env:
+          CLOUDFLARE_SCHEMA_URL: https://raw.githubusercontent.com/cloudflare/api-schemas/aefa753f1190c85866f65dcc7f348e18c7a1ca4a/openapi.json
+          CLOUDFLARE_SCHEMA_SHA256: 6c141cf38b45a514fcba04d322d43916eaba179a4442c8d91afaf5e7a66c8f1f
+        run: |
+          curl --fail --location --silent --show-error \
+            --output /tmp/cloudflare-openapi.json \
+            "$CLOUDFLARE_SCHEMA_URL"
+          echo "$CLOUDFLARE_SCHEMA_SHA256  /tmp/cloudflare-openapi.json" \
+            | sha256sum --check --strict
+          uv run python scripts/build_endpoint_coverage.py /tmp/cloudflare-openapi.json
+          git diff --exit-code -- \
+            src/cloudflare_mcp/data/endpoint_coverage.json \
+            docs/endpoint-coverage.md
+      - name: Scan exact tag history with Gitleaks
+        if: matrix.python == '3.12.13'
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/repo:ro" --workdir /repo \
+            "$GITLEAKS_IMAGE" git --config .gitleaks.toml \
+            --redact --verbose --no-banner .
+      - name: Validate workflow syntax and semantics
+        if: matrix.python == '3.12.13'
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl --fail --location --silent --show-error \
+            --output /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint
+      - name: Scan source configuration and secrets with Trivy
+        if: matrix.python == '3.12.13'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          scan-type: fs
+          scan-ref: .
+          scanners: misconfig,secret
+          format: table
+          exit-code: 1
+          severity: HIGH,CRITICAL
+
+  public-quality-gates:
+    name: Require protected public main and exact-SHA Verify and CodeQL
+    runs-on: ubuntu-24.04
+    needs: [verify-python, image]
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require the public canonical repository and protected main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test "$GITHUB_REPOSITORY" = MADPANDA3D/CF-MCP
+          VISIBILITY=$(gh api "repos/$GITHUB_REPOSITORY" --jq .visibility)
+          DEFAULT_BRANCH=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          PROTECTED=$(gh api "repos/$GITHUB_REPOSITORY/branches/$DEFAULT_BRANCH" --jq .protected)
+          if [[ "$VISIBILITY" != public || "$DEFAULT_BRANCH" != main || "$PROTECTED" != true ]]; then
+            echo "::error::Release requires public MADPANDA3D/CF-MCP with protected default branch main."
+            exit 1
+          fi
+      - name: Require successful exact-SHA Verify workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=completed&per_page=100" \
+            > /tmp/cloudflare-verify-runs.json
+          mapfile -t RUN_IDS < <(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/cloudflare-verify-runs.json').read_text())
+          runs = [
+              run for run in payload.get('workflow_runs', [])
+              if run.get('head_sha') == os.environ['GITHUB_SHA']
+              and run.get('head_branch') == 'main'
+              and run.get('event') in {'push', 'workflow_dispatch'}
+              and run.get('status') == 'completed'
+              and run.get('conclusion') == 'success'
+          ]
+          for run in sorted(
+              runs,
+              key=lambda item: (item.get('run_attempt', 0), item['id']),
+              reverse=True,
+          ):
+              print(run['id'])
+          PY
+          )
+
+          for run_id in "${RUN_IDS[@]}"; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+              > /tmp/cloudflare-verify-jobs.json
+            if python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/cloudflare-verify-jobs.json').read_text())
+          successful = {
+              job.get('name')
+              for job in payload.get('jobs', [])
+              if job.get('status') == 'completed' and job.get('conclusion') == 'success'
+          }
+          required = {
+              'Secret scan',
+              'Filesystem policy scan',
+              'Python 3.12.13',
+              'Python 3.13.11',
+              'Python package',
+              'Hardened image',
+          }
+          raise SystemExit(0 if required <= successful else 1)
+          PY
+            then
+              echo "Exact-SHA Verify gate passed with workflow run $run_id."
+              exit 0
+            fi
+          done
+
+          echo "::error::No complete successful Verify workflow exists for exact public main SHA $GITHUB_SHA."
+          exit 1
+      - name: Require successful exact-SHA public CodeQL workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/codeql.yml/runs?head_sha=$GITHUB_SHA&status=completed&per_page=100" \
+            > /tmp/cloudflare-codeql-runs.json
+          mapfile -t RUN_IDS < <(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/cloudflare-codeql-runs.json').read_text())
+          runs = [
+              run for run in payload.get('workflow_runs', [])
+              if run.get('head_sha') == os.environ['GITHUB_SHA']
+              and run.get('head_branch') == 'main'
+              and run.get('event') in {'push', 'workflow_dispatch'}
+              and run.get('status') == 'completed'
+              and run.get('conclusion') == 'success'
+          ]
+          for run in sorted(
+              runs,
+              key=lambda item: (item.get('run_attempt', 0), item['id']),
+              reverse=True,
+          ):
+              print(run['id'])
+          PY
+          )
+
+          for run_id in "${RUN_IDS[@]}"; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+              > /tmp/cloudflare-codeql-jobs.json
+            if python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path('/tmp/cloudflare-codeql-jobs.json').read_text())
+          matched = any(
+              job.get('name') == 'Python security analysis'
+              and job.get('status') == 'completed'
+              and job.get('conclusion') == 'success'
+              for job in payload.get('jobs', [])
+          )
+          raise SystemExit(0 if matched else 1)
+          PY
+            then
+              echo "Exact-SHA public CodeQL gate passed with workflow run $run_id."
+              exit 0
+            fi
+          done
+
+          echo "::error::No successful public CodeQL analysis exists for exact main SHA $GITHUB_SHA."
+          exit 1
+
+  compose:
+    name: Validate every Compose deployment variant
+    runs-on: ubuntu-24.04
+    needs: verify-python
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Validate source-build and immutable-release Compose
+        env:
+          MCP_ACCESS_TOKEN: release-standalone-token-000000000000000000000000000000000000000000
+          MCP_PORTAL_GRANT_TOKEN: release-portal-grant-000000000000000000000000000000000000000000
+          MCP_BUILD_SHA: ${{ github.sha }}
+          MCP_SOURCE_FINGERPRINT: 1111111111111111111111111111111111111111111111111111111111111111
+          MCP_RELEASE_DIGEST: 2222222222222222222222222222222222222222222222222222222222222222
+          MCP_TENANT_ID_HEADER: x-madpanda-user-id
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.portal.yml config --quiet
+          docker compose -f docker-compose.release.yml config --quiet
+          docker compose -f docker-compose.portal.release.yml config --quiet
+          for manifest in \
+            docker-compose.yml \
+            docker-compose.portal.yml \
+            docker-compose.release.yml \
+            docker-compose.portal.release.yml; do
+            docker compose -f "$manifest" config --format json \
+              > "/tmp/${manifest}.json"
+          done
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          expected_digest = '2' * 64
+          expected_image = (
+              'ghcr.io/madpanda3d/cloudflare-mcp-server@sha256:'
+              f'{expected_digest}'
+          )
+          variants = {
+              'docker-compose.yml': ('standalone', True),
+              'docker-compose.portal.yml': ('portal', True),
+              'docker-compose.release.yml': ('standalone', False),
+              'docker-compose.portal.release.yml': ('portal', False),
+          }
+          for manifest, (mode, source_build) in variants.items():
+              config = json.loads(Path(f'/tmp/{manifest}.json').read_text())
+              service = config['services']['cloudflare-mcp']
+              assert ('build' in service) is source_build, manifest
+              assert service['read_only'] is True, manifest
+              assert service['user'] == '10001:10001', manifest
+              assert service['cap_drop'] == ['ALL'], manifest
+              assert service['security_opt'] == ['no-new-privileges:true'], manifest
+              environment = service['environment']
+              assert environment['MCP_MODE'] == mode, manifest
+              assert 'MCP_BUILD_SHA' not in environment, manifest
+              assert 'MCP_SOURCE_FINGERPRINT' not in environment, manifest
+              assert 'MCP_APPROVAL_SIGNING_KEY' in environment, manifest
+              assert not environment['MCP_APPROVAL_SIGNING_KEY'], manifest
+              assert 'MCP_ALLOW_HIGH_RISK_OPERATIONS' not in environment, manifest
+              if mode == 'portal':
+                  assert environment['MCP_TENANT_ID_HEADER'] == 'x-madpanda-user-id', manifest
+              else:
+                  assert 'MCP_TENANT_ID_HEADER' not in environment, manifest
+              if source_build:
+                  assert service['image'] == 'cloudflare-mcp:local-source', manifest
+                  assert environment.get('MCP_IMAGE_REFERENCE') is None, manifest
+                  assert service['build']['args']['BUILD_SHA'] == os.environ['MCP_BUILD_SHA'], manifest
+                  assert service['build']['args']['SOURCE_FINGERPRINT'] == os.environ['MCP_SOURCE_FINGERPRINT'], manifest
+              else:
+                  assert service['image'] == expected_image, manifest
+                  assert service['pull_policy'] == 'always', manifest
+                  assert environment['MCP_IMAGE_REFERENCE'] == expected_image, manifest
+          PY
+
+  package:
+    name: Build exact Python artifacts
+    runs-on: ubuntu-24.04
+    needs: verify-python
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.12.13
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Fix the reproducible package epoch to the tagged commit
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
+          echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" >> "$GITHUB_ENV"
+      - name: Build twice and prove deterministic tagged artifacts
+        run: |
+          uv sync --frozen --group dev
+          mkdir -p /tmp/cloudflare-package-rebuild
+          uv build --out-dir dist
+          uv build --out-dir /tmp/cloudflare-package-rebuild
+          (cd dist && sha256sum -- *.whl *.tar.gz | sort) \
+            > /tmp/cloudflare-package-first.sha256
+          (cd /tmp/cloudflare-package-rebuild && sha256sum -- *.whl *.tar.gz | sort) \
+            > /tmp/cloudflare-package-second.sha256
+          diff -u /tmp/cloudflare-package-first.sha256 /tmp/cloudflare-package-second.sha256
+          uv run twine check dist/*.whl dist/*.tar.gz
+          uv run python scripts/check_package_archives.py
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          mkdir -p release
+          (cd dist && sha256sum -- *.whl *.tar.gz > ../release/SHA256SUMS)
+      - name: Install and inspect the exact wheel
+        run: |
+          python -m venv /tmp/cloudflare-release-wheel-venv
+          uv pip install --python /tmp/cloudflare-release-wheel-venv/bin/python \
+            --require-hashes --requirement requirements.lock
+          uv pip install --python /tmp/cloudflare-release-wheel-venv/bin/python \
+            --no-deps dist/*.whl
+          /tmp/cloudflare-release-wheel-venv/bin/python - <<'PY'
+          from importlib.metadata import entry_points, version
+
+          from cloudflare_mcp import __version__
+          from cloudflare_mcp.server import TOOL_NAMES
+          from cloudflare_mcp.tool_manifest import build_tool_manifest
+
+          assert version('madpanda-cloudflare-mcp') == '1.0.0'
+          assert __version__ == '1.0.0'
+          assert len(TOOL_NAMES) == 6
+          assert build_tool_manifest()['counts']['agentReady'] == 5
+          scripts = {
+              item.name: item.value for item in entry_points(group='console_scripts')
+          }
+          assert scripts['cloudflare-mcp'] == 'cloudflare_mcp.server:main'
+          PY
+      - name: Store exact GitHub Release artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: cloudflare-mcp-v1.0.0-dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+            release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    name: Publish and verify a run-scoped image candidate
+    runs-on: ubuntu-24.04
+    needs: [verify-python, compose, package]
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      candidate_ref: ${{ steps.candidate.outputs.ref }}
+      digest: ${{ steps.resolve.outputs.digest }}
+      fingerprint: ${{ steps.source.outputs.fingerprint }}
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.ref }}
+      - name: Require the canonical repository identity before package mutation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          test "$GITHUB_REPOSITORY" = MADPANDA3D/CF-MCP
+          test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = main
+      - name: Download exact Python artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cloudflare-mcp-v1.0.0-dist
+          path: .
+      - name: Verify artifact checksums
+        run: |
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
+      - name: Compute exact-source fingerprint
+        id: source
+        run: echo "fingerprint=$(git archive --format=tar HEAD | sha256sum | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select the reusable candidate reference for this workflow run
+        id: candidate
+        run: echo "ref=${IMAGE_NAME}:candidate-${GITHUB_SHA}-${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+      - name: Reuse an existing candidate when a failed job is rerun
+        id: existing
+        env:
+          CANDIDATE_REF: ${{ steps.candidate.outputs.ref }}
+        run: |
+          if docker buildx imagetools inspect "$CANDIDATE_REF" --raw \
+            > /tmp/cloudflare-existing-candidate.json 2>/dev/null; then
+            DIGEST="sha256:$(sha256sum /tmp/cloudflare-existing-candidate.json | awk '{print $1}')"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+            echo "Reusing $CANDIDATE_REF at $DIGEST"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish only the run-scoped candidate with SBOM and provenance
+        id: push
+        if: steps.existing.outputs.exists != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.candidate.outputs.ref }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=1.0.0
+          build-args: |
+            BUILD_SHA=${{ github.sha }}
+            SOURCE_FINGERPRINT=${{ steps.source.outputs.fingerprint }}
+            IMAGE_VERSION=1.0.0
+          sbom: true
+          provenance: mode=max
+      - name: Resolve and validate the exact candidate digest
+        id: resolve
+        env:
+          CANDIDATE_REF: ${{ steps.candidate.outputs.ref }}
+          EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          if [[ "${{ steps.existing.outputs.exists }}" == true ]]; then
+            DIGEST=$EXISTING_DIGEST
+          else
+            DIGEST=$PUSHED_DIGEST
+          fi
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Candidate publication did not produce a valid sha256 digest."
+            exit 1
+          fi
+          docker buildx imagetools inspect "$CANDIDATE_REF" --raw \
+            > /tmp/cloudflare-candidate.json
+          OBSERVED="sha256:$(sha256sum /tmp/cloudflare-candidate.json | awk '{print $1}')"
+          if [[ "$OBSERVED" != "$DIGEST" ]]; then
+            echo "::error::Candidate reference resolved to $OBSERVED instead of $DIGEST."
+            exit 1
+          fi
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+      - name: Require exact OCI identity labels
+        env:
+          IMAGE_DIGEST: ${{ steps.resolve.outputs.digest }}
+          SOURCE_FINGERPRINT: ${{ steps.source.outputs.fingerprint }}
+        run: |
+          EXACT_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
+          docker pull "$EXACT_IMAGE"
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$EXACT_IMAGE")" = "$GITHUB_SHA"
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}' "$EXACT_IMAGE")" = 1.0.0
+          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.source\" }}' "$EXACT_IMAGE")" = "https://github.com/$GITHUB_REPOSITORY"
+          test "$(docker image inspect --format '{{ index .Config.Labels \"com.madpanda.source-fingerprint\" }}' "$EXACT_IMAGE")" = "$SOURCE_FINGERPRINT"
+      - name: Scan exact published candidate digest with Trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.72.0
+          image-ref: ${{ env.IMAGE_NAME }}@${{ steps.resolve.outputs.digest }}
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+      - name: Require anonymous candidate and exact-digest pull access
+        env:
+          CANDIDATE_REF: ${{ steps.candidate.outputs.ref }}
+          IMAGE_DIGEST: ${{ steps.resolve.outputs.digest }}
+        run: |
+          docker logout ghcr.io
+          if ! docker manifest inspect "$CANDIDATE_REF" >/dev/null \
+            || ! docker manifest inspect "${IMAGE_NAME}@${IMAGE_DIGEST}" >/dev/null; then
+            echo "::error::The Cloudflare MCP GHCR package is not public. Make only this package public, grant the canonical repository Actions access, and rerun failed jobs in this workflow run."
+            exit 1
+          fi
+          docker pull "${IMAGE_NAME}@${IMAGE_DIGEST}"
+      - name: Require every stable tag to be absent or already identical
+        env:
+          IMAGE_DIGEST: ${{ steps.resolve.outputs.digest }}
+        run: |
+          PACKAGE_PATH=${IMAGE_NAME#ghcr.io/}
+          if [[ "$PACKAGE_PATH" == "$IMAGE_NAME" || -z "$PACKAGE_PATH" ]]; then
+            echo "::error::IMAGE_NAME must be a ghcr.io package path."
+            exit 1
+          fi
+          if ! TOKEN_PAYLOAD=$(curl --fail --silent --show-error --get \
+            --data-urlencode service=ghcr.io \
+            --data-urlencode "scope=repository:${PACKAGE_PATH}:pull" \
+            https://ghcr.io/token); then
+            echo "::error::Could not obtain an anonymous GHCR pull token."
+            exit 1
+          fi
+          REGISTRY_TOKEN=$(TOKEN_PAYLOAD="$TOKEN_PAYLOAD" python - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ['TOKEN_PAYLOAD'])
+          print(payload.get('token') or payload.get('access_token') or '')
+          PY
+          )
+          if [[ -z "$REGISTRY_TOKEN" ]]; then
+            echo "::error::GHCR did not issue an anonymous pull token."
+            exit 1
+          fi
+
+          MANIFEST_ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          for tag in 1.0.0 1.0 1 latest; do
+            HEADERS="/tmp/cloudflare-stable-${tag}.headers"
+            if ! STATUS=$(curl --silent --show-error --head \
+              --output /dev/null --dump-header "$HEADERS" --write-out '%{http_code}' \
+              --header "Authorization: Bearer $REGISTRY_TOKEN" \
+              --header "Accept: $MANIFEST_ACCEPT" \
+              "https://ghcr.io/v2/${PACKAGE_PATH}/manifests/${tag}"); then
+              echo "::error::Could not classify ${IMAGE_NAME}:${tag}."
+              exit 1
+            fi
+            case "$STATUS" in
+              200)
+                OBSERVED=$(tr -d '\r' < "$HEADERS" \
+                  | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}' | tail -n 1)
+                if [[ "$OBSERVED" != "$IMAGE_DIGEST" ]]; then
+                  echo "::error::${IMAGE_NAME}:${tag} already resolves to $OBSERVED; refusing to overwrite it with $IMAGE_DIGEST."
+                  exit 1
+                fi
+                echo "${IMAGE_NAME}:${tag} already resolves to the verified digest."
+                ;;
+              404)
+                echo "${IMAGE_NAME}:${tag} is absent."
+                ;;
+              401|403)
+                echo "::error::GHCR visibility or access prevents classifying ${IMAGE_NAME}:${tag}."
+                exit 1
+                ;;
+              *)
+                echo "::error::GHCR returned HTTP $STATUS for ${IMAGE_NAME}:${tag}."
+                exit 1
+                ;;
+            esac
+          done
+      - name: Pull and start Compose at the immutable candidate digest
+        env:
+          IMAGE_DIGEST: ${{ steps.resolve.outputs.digest }}
+          MCP_ACCESS_TOKEN: release-standalone-token-000000000000000000000000000000000000000000
+          MCP_HOST_PORT: 18000
+          SOURCE_FINGERPRINT: ${{ steps.source.outputs.fingerprint }}
+        run: |
+          export MCP_RELEASE_DIGEST="${IMAGE_DIGEST#sha256:}"
+          cleanup() {
+            docker compose -f docker-compose.release.yml down --remove-orphans \
+              >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker compose -f docker-compose.release.yml config --format json \
+            > /tmp/cloudflare-published.json
+          EXPECTED_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = json.loads(Path('/tmp/cloudflare-published.json').read_text())
+          service = config['services']['cloudflare-mcp']
+          assert 'build' not in service
+          assert service['image'] == os.environ['EXPECTED_IMAGE']
+          assert service['pull_policy'] == 'always'
+          assert service['environment']['MCP_IMAGE_REFERENCE'] == os.environ['EXPECTED_IMAGE']
+          assert service['environment']['MCP_MODE'] == 'standalone'
+          assert 'MCP_BUILD_SHA' not in service['environment']
+          assert 'MCP_SOURCE_FINGERPRINT' not in service['environment']
+          PY
+          docker compose -f docker-compose.release.yml pull cloudflare-mcp
+          docker compose -f docker-compose.release.yml up --detach --no-build cloudflare-mcp
+          healthy=false
+          for _ in {1..60}; do
+            if [[ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' cloudflare-mcp)" == healthy ]]; then
+              healthy=true
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$healthy" != true ]]; then
+            docker compose -f docker-compose.release.yml logs cloudflare-mcp >&2 || true
+            exit 1
+          fi
+          EXPECTED_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}" python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          with opener.open('http://127.0.0.1:18000/health', timeout=5) as response:
+              health = json.load(response)
+          assert health['status'] == 'healthy'
+          assert health['version'] == '1.0.0'
+          assert health['build_sha'] == os.environ['GITHUB_SHA']
+          assert health['source_fingerprint'] == os.environ['SOURCE_FINGERPRINT']
+          assert health['image_reference'] == os.environ['EXPECTED_IMAGE']
+          PY
+      - name: Smoke the exact anonymously pulled digest in both modes
+        run: |
+          bash .github/scripts/smoke-image.sh \
+            "${IMAGE_NAME}@${{ steps.resolve.outputs.digest }}" \
+            "$GITHUB_SHA" \
+            "${{ steps.source.outputs.fingerprint }}" \
+            "${IMAGE_NAME}@${{ steps.resolve.outputs.digest }}"
+
+  attest-release-subjects:
+    name: Attest exact public package and image subjects
+    runs-on: ubuntu-24.04
+    needs: [package, image, public-quality-gates]
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Download exact Python artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cloudflare-mcp-v1.0.0-dist
+          path: .
+      - name: Verify artifact checksums
+        run: |
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
+      - name: Attest Python GitHub Release artifacts
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: dist/*
+      - name: Attest exact published image digest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.image.outputs.digest }}
+          push-to-registry: true
+
+  promote-image:
+    name: Promote the verified candidate without rebuilding
+    runs-on: ubuntu-24.04
+    needs: [package, image, public-quality-gates, attest-release-subjects]
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CANDIDATE_REF: ${{ needs.image.outputs.candidate_ref }}
+      IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Revalidate the candidate and classify every destination
+        run: |
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Upstream candidate digest is invalid."
+            exit 1
+          fi
+          docker buildx imagetools inspect "$CANDIDATE_REF" --raw \
+            > /tmp/cloudflare-promotion-source.json
+          SOURCE_DIGEST="sha256:$(sha256sum /tmp/cloudflare-promotion-source.json | awk '{print $1}')"
+          if [[ "$SOURCE_DIGEST" != "$IMAGE_DIGEST" ]]; then
+            echo "::error::Candidate moved from $IMAGE_DIGEST to $SOURCE_DIGEST; refusing promotion."
+            exit 1
+          fi
+
+          PACKAGE_PATH=${IMAGE_NAME#ghcr.io/}
+          TOKEN_PAYLOAD=$(curl --fail --silent --show-error --get \
+            --data-urlencode service=ghcr.io \
+            --data-urlencode "scope=repository:${PACKAGE_PATH}:pull" \
+            https://ghcr.io/token)
+          REGISTRY_TOKEN=$(TOKEN_PAYLOAD="$TOKEN_PAYLOAD" python - <<'PY'
+          import json
+          import os
+
+          payload = json.loads(os.environ['TOKEN_PAYLOAD'])
+          print(payload.get('token') or payload.get('access_token') or '')
+          PY
+          )
+          test -n "$REGISTRY_TOKEN"
+          MANIFEST_ACCEPT='application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json'
+          : > /tmp/cloudflare-tags-to-create
+          for tag in 1.0.0 1.0 1 latest; do
+            HEADERS="/tmp/cloudflare-promotion-${tag}.headers"
+            STATUS=$(curl --silent --show-error --head \
+              --output /dev/null --dump-header "$HEADERS" --write-out '%{http_code}' \
+              --header "Authorization: Bearer $REGISTRY_TOKEN" \
+              --header "Accept: $MANIFEST_ACCEPT" \
+              "https://ghcr.io/v2/${PACKAGE_PATH}/manifests/${tag}")
+            case "$STATUS" in
+              200)
+                OBSERVED=$(tr -d '\r' < "$HEADERS" \
+                  | awk -F': ' 'tolower($1) == "docker-content-digest" {print $2}' | tail -n 1)
+                if [[ "$OBSERVED" != "$IMAGE_DIGEST" ]]; then
+                  echo "::error::${IMAGE_NAME}:${tag} moved to $OBSERVED; refusing promotion."
+                  exit 1
+                fi
+                ;;
+              404)
+                echo "$tag" >> /tmp/cloudflare-tags-to-create
+                ;;
+              *)
+                echo "::error::GHCR returned HTTP $STATUS while rechecking ${IMAGE_NAME}:${tag}."
+                exit 1
+                ;;
+            esac
+          done
+      - name: Attach missing release tags to the exact candidate digest
+        run: |
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            docker buildx imagetools create \
+              --tag "${IMAGE_NAME}:${tag}" \
+              "${IMAGE_NAME}@${IMAGE_DIGEST}"
+          done < /tmp/cloudflare-tags-to-create
+      - name: Require every promoted tag to resolve anonymously to the exact digest
+        run: |
+          docker logout ghcr.io
+          for tag in 1.0.0 1.0 1 latest; do
+            DESTINATION="${IMAGE_NAME}:${tag}"
+            docker buildx imagetools inspect "$DESTINATION" --raw \
+              > /tmp/cloudflare-promoted.json
+            OBSERVED="sha256:$(sha256sum /tmp/cloudflare-promoted.json | awk '{print $1}')"
+            if [[ "$OBSERVED" != "$IMAGE_DIGEST" ]]; then
+              echo "::error::$DESTINATION resolves to $OBSERVED instead of $IMAGE_DIGEST."
+              exit 1
+            fi
+          done
+
+  github-release:
+    name: Create GitHub Release last
+    runs-on: ubuntu-24.04
+    needs: [package, image, promote-image]
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download exact Python artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: cloudflare-mcp-v1.0.0-dist
+          path: .
+      - name: Verify artifact checksums
+        run: (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
+      - name: Create or repair the final GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          cat > /tmp/cloudflare-mcp-release-notes.md <<EOF
+          Cloudflare MCP v1.0.0 clean public release.
+
+          Python wheel and source archive are attached to this GitHub Release.
+          This project intentionally does not publish to PyPI.
+
+          Container: \`${IMAGE_NAME}@${IMAGE_DIGEST}\`
+
+          Verify package files with the attached SHA256SUMS and deploy the container by exact digest.
+          EOF
+          if gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* release/SHA256SUMS \
+              --repo "$GH_REPO" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GH_REPO" \
+              --verify-tag \
+              --title "MADPANDA3D Cloudflare MCP v1.0.0" \
+              --notes-file /tmp/cloudflare-mcp-release-notes.md \
+              --latest
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* release/SHA256SUMS \
+              --repo "$GH_REPO" \
+              --verify-tag \
+              --title "MADPANDA3D Cloudflare MCP v1.0.0" \
+              --notes-file /tmp/cloudflare-mcp-release-notes.md \
+              --latest
+          fi
