@@ -188,6 +188,9 @@ jobs:
             /tmp/cloudflare-ci-package-second.sha256
           uv run twine check dist/*.whl dist/*.tar.gz
           uv run python scripts/check_package_archives.py
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f ! -name '*.whl' ! -name '*.tar.gz' ! -name '.gitignore' | wc -l)" -eq 0
       - name: Verify package version and console entry point
         run: |
           PACKAGE_VERSION=$(python - <<'PY'
