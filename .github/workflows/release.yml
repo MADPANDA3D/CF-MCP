@@ -299,7 +299,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Validate source-build and immutable-release Compose
         env:
           MCP_ACCESS_TOKEN: release-standalone-token-000000000000000000000000000000000000000000
@@ -371,13 +371,18 @@ jobs:
     name: Build exact Python artifacts
     runs-on: ubuntu-24.04
     needs: verify-python
+    outputs:
+      wheel_name: ${{ steps.artifacts.outputs.wheel_name }}
+      wheel_sha256: ${{ steps.artifacts.outputs.wheel_sha256 }}
+      sdist_name: ${{ steps.artifacts.outputs.sdist_name }}
+      sdist_sha256: ${{ steps.artifacts.outputs.sdist_sha256 }}
     steps:
       - name: Check out exact tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -434,23 +439,29 @@ jobs:
           }
           assert scripts['cloudflare-mcp'] == 'cloudflare_mcp.server:main'
           PY
-      - name: Store exact GitHub Release artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: cloudflare-mcp-v1.0.0-dist
-          path: |
-            dist/*.whl
-            dist/*.tar.gz
-            release/SHA256SUMS
-          if-no-files-found: error
-          retention-days: 1
+      - name: Record exact deterministic artifact identities
+        id: artifacts
+        run: |
+          WHEEL=$(find dist -maxdepth 1 -type f -name '*.whl' -printf '%f\n')
+          SDIST=$(find dist -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n')
+          test -n "$WHEEL"
+          test -n "$SDIST"
+          WHEEL_SHA256=$(sha256sum "dist/$WHEEL" | awk '{print $1}')
+          SDIST_SHA256=$(sha256sum "dist/$SDIST" | awk '{print $1}')
+          [[ "$WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          {
+            echo "wheel_name=$WHEEL"
+            echo "wheel_sha256=$WHEEL_SHA256"
+            echo "sdist_name=$SDIST"
+            echo "sdist_sha256=$SDIST_SHA256"
+          } >> "$GITHUB_OUTPUT"
 
   image:
     name: Publish and verify a run-scoped image candidate
     runs-on: ubuntu-24.04
     needs: [verify-python, compose, package]
     permissions:
-      actions: read
       contents: read
       packages: write
     outputs:
@@ -463,22 +474,13 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Require the canonical repository identity before package mutation
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           test "$GITHUB_REPOSITORY" = MADPANDA3D/CF-MCP
           test "$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)" = main
-      - name: Download exact Python artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: cloudflare-mcp-v1.0.0-dist
-          path: .
-      - name: Verify artifact checksums
-        run: |
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
-          (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
       - name: Compute exact-source fingerprint
         id: source
         run: echo "fingerprint=$(git archive --format=tar HEAD | sha256sum | awk '{print $1}')" >> "$GITHUB_OUTPUT"
@@ -716,25 +718,55 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [package, image, public-quality-gates]
     permissions:
-      actions: read
       attestations: write
       contents: read
       id-token: write
       packages: write
     steps:
-      - name: Download exact Python artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - name: Check out exact tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          name: cloudflare-mcp-v1.0.0-dist
-          path: .
-      - name: Verify artifact checksums
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.12.13
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Rebuild and require the exact package identities
+        env:
+          EXPECTED_WHEEL_NAME: ${{ needs.package.outputs.wheel_name }}
+          EXPECTED_WHEEL_SHA256: ${{ needs.package.outputs.wheel_sha256 }}
+          EXPECTED_SDIST_NAME: ${{ needs.package.outputs.sdist_name }}
+          EXPECTED_SDIST_SHA256: ${{ needs.package.outputs.sdist_sha256 }}
         run: |
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 2
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          export SOURCE_DATE_EPOCH
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          uv build --out-dir dist
+          test -f "dist/$EXPECTED_WHEEL_NAME"
+          test -f "dist/$EXPECTED_SDIST_NAME"
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f ! -name '*.whl' ! -name '*.tar.gz' ! -name '.gitignore' | wc -l)" -eq 0
+          mkdir -p release
+          printf '%s  %s\n%s  %s\n' \
+            "$EXPECTED_WHEEL_SHA256" "$EXPECTED_WHEEL_NAME" \
+            "$EXPECTED_SDIST_SHA256" "$EXPECTED_SDIST_NAME" \
+            > release/SHA256SUMS
           (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
       - name: Attest Python GitHub Release artifacts
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
-          subject-path: dist/*
+          subject-checksums: release/SHA256SUMS
       - name: Attest exact published image digest
         uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
         with:
@@ -843,16 +875,48 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [package, image, promote-image]
     permissions:
-      actions: read
       contents: write
     steps:
-      - name: Download exact Python artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - name: Check out exact tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          name: cloudflare-mcp-v1.0.0-dist
-          path: .
-      - name: Verify artifact checksums
-        run: (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.12.13
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Rebuild and require the exact package identities
+        env:
+          EXPECTED_WHEEL_NAME: ${{ needs.package.outputs.wheel_name }}
+          EXPECTED_WHEEL_SHA256: ${{ needs.package.outputs.wheel_sha256 }}
+          EXPECTED_SDIST_NAME: ${{ needs.package.outputs.sdist_name }}
+          EXPECTED_SDIST_SHA256: ${{ needs.package.outputs.sdist_sha256 }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
+          export SOURCE_DATE_EPOCH
+          [[ "$SOURCE_DATE_EPOCH" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_WHEEL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SDIST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          uv build --out-dir dist
+          test -f "dist/$EXPECTED_WHEEL_NAME"
+          test -f "dist/$EXPECTED_SDIST_NAME"
+          test "$(find dist -maxdepth 1 -type f -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -type f ! -name '*.whl' ! -name '*.tar.gz' ! -name '.gitignore' | wc -l)" -eq 0
+          mkdir -p release
+          printf '%s  %s\n%s  %s\n' \
+            "$EXPECTED_WHEEL_SHA256" "$EXPECTED_WHEEL_NAME" \
+            "$EXPECTED_SDIST_SHA256" "$EXPECTED_SDIST_NAME" \
+            > release/SHA256SUMS
+          (cd dist && sha256sum --check --strict ../release/SHA256SUMS)
       - name: Create or repair the final GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
