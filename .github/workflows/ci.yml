@@ -43,6 +43,11 @@ jobs:
           echo "${ACTIONLINT_SHA256}  /tmp/actionlint.tar.gz" | sha256sum --check --strict
           tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
           /tmp/actionlint
+      - name: Validate the public-main ruleset with the workflow identity
+        if: github.event.repository.visibility == 'public' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/verify-live-ruleset.sh --allow-hidden-bypass-actors
 
   source-scan:
     name: Filesystem policy scan
