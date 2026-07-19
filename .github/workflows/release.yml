@@ -299,7 +299,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Validate source-build and immutable-release Compose
         env:
           MCP_ACCESS_TOKEN: release-standalone-token-000000000000000000000000000000000000000000
@@ -382,7 +382,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -472,7 +472,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Require the canonical repository identity before package mutation
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -726,7 +726,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
@@ -879,7 +879,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
