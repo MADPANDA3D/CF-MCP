@@ -461,6 +461,8 @@ jobs:
     name: Publish and verify a run-scoped image candidate
     runs-on: ubuntu-24.04
     needs: [verify-python, compose, package]
+    env:
+      DOCKER_BUILD_RECORD_UPLOAD: false
     permissions:
       contents: read
       packages: write
@@ -559,10 +561,10 @@ jobs:
         run: |
           EXACT_IMAGE="${IMAGE_NAME}@${IMAGE_DIGEST}"
           docker pull "$EXACT_IMAGE"
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' "$EXACT_IMAGE")" = "$GITHUB_SHA"
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.version\" }}' "$EXACT_IMAGE")" = 1.0.0
-          test "$(docker image inspect --format '{{ index .Config.Labels \"org.opencontainers.image.source\" }}' "$EXACT_IMAGE")" = "https://github.com/$GITHUB_REPOSITORY"
-          test "$(docker image inspect --format '{{ index .Config.Labels \"com.madpanda.source-fingerprint\" }}' "$EXACT_IMAGE")" = "$SOURCE_FINGERPRINT"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$EXACT_IMAGE")" = "$GITHUB_SHA"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$EXACT_IMAGE")" = 1.0.0
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' "$EXACT_IMAGE")" = "https://github.com/$GITHUB_REPOSITORY"
+          test "$(docker image inspect --format '{{ index .Config.Labels "com.madpanda.source-fingerprint" }}' "$EXACT_IMAGE")" = "$SOURCE_FINGERPRINT"
       - name: Scan exact published candidate digest with Trivy
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
