@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: https://github.com/MADPANDA3D/CF-MCP/security/advisories/new
+    about: Report vulnerabilities privately. Never place secrets in an issue.
+  - name: Cloudflare product support
+    url: https://www.cloudflare.com/support/
+    about: Account, billing, quota, token, and provider-service support belongs with Cloudflare.

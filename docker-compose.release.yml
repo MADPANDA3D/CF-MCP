@@ -1,0 +1,45 @@
+name: cloudflare-mcp
+
+services:
+  cloudflare-mcp:
+    image: ghcr.io/madpanda3d/cloudflare-mcp-server@sha256:${MCP_RELEASE_DIGEST:?Set MCP_RELEASE_DIGEST to the exact 64-character image digest}
+    pull_policy: always
+    container_name: cloudflare-mcp
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+      MCP_MODE: standalone
+      MCP_ACCESS_TOKEN: ${MCP_ACCESS_TOKEN:-}
+      MCP_IMAGE_REFERENCE: ghcr.io/madpanda3d/cloudflare-mcp-server@sha256:${MCP_RELEASE_DIGEST:?Set MCP_RELEASE_DIGEST to the exact 64-character image digest}
+      MCP_EXPECTED_TOOL_COUNT: 6
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-localhost,127.0.0.1,[::1],cloudflare-mcp}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+      MCP_REQUEST_BODY_MAX_BYTES: ${MCP_REQUEST_BODY_MAX_BYTES:-131072}
+      MCP_RESPONSE_BODY_MAX_BYTES: ${MCP_RESPONSE_BODY_MAX_BYTES:-1048576}
+      MCP_PROVIDER_RESPONSE_MAX_BYTES: ${MCP_PROVIDER_RESPONSE_MAX_BYTES:-65536}
+      MCP_APPROVAL_SIGNING_KEY: ${MCP_APPROVAL_SIGNING_KEY:-}
+    ports:
+      - "127.0.0.1:${MCP_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,os,urllib.request; o=urllib.request.build_opener(urllib.request.ProxyHandler({})); r=o.open('http://127.0.0.1:8000/health',timeout=3); b=r.read(65537); r.close(); p=json.loads(b); raise SystemExit(0 if len(b)<=65536 and p.get('status')=='healthy' and p.get('tool_count')==int(os.environ['MCP_EXPECTED_TOOL_COUNT']) else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

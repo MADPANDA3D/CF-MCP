@@ -1,0 +1,32 @@
+name: Feature proposal
+description: Propose a bounded tool, endpoint-family, or product improvement.
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or agent workflow is blocked today?
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Proposed contract
+      description: Include inputs, bounded outputs, risk, external approval, retry, quota or cost behavior, and Cloudflare API family.
+    validations:
+      required: true
+  - type: textarea
+    id: coverage
+    attributes:
+      label: Endpoint coverage
+      description: Identify the pinned method/path or explain why the change is local-only.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
