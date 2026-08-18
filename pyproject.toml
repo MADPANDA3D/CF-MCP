@@ -20,6 +20,7 @@ classifiers = [
   "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
 ]
 dependencies = [
+  "cryptography>=50.0.0,<51",
   "fastmcp>=3.4.0,<4",
   "httpx>=0.28.1,<1",
   "pydantic>=2.13.4,<3",
