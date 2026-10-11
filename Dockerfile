@@ -1,5 +1,5 @@
 # linux/amd64 Python 3.12.13 slim-bookworm pin. Update the digest deliberately.
-FROM python:3.12.13-slim-bookworm@sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d AS builder
+FROM python:3.12.15-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258 AS builder
 
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -24,7 +24,7 @@ RUN uv sync --frozen --no-dev --no-editable \
 
 
 # Keep project build tooling and project source files out of the runtime image.
-FROM python:3.12.13-slim-bookworm@sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d
+FROM python:3.12.15-slim-bookworm@sha256:34386ef0cb081344d7ec1c103ba398e6e9f64e9ab3a1509accc92a4e24a07258
 
 ARG BUILD_SHA=development
 ARG SOURCE_FINGERPRINT=development
